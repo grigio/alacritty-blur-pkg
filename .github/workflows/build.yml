@@ -6,6 +6,7 @@ on:
     paths:
       - 'PKGBUILD'
       - 'winit-ext-background-effect.patch'
+      - 'alacritty-scroll-velocity.patch'
       - '.github/workflows/build.yml'
   workflow_dispatch:
   # No schedule on purpose: every source here is pinned (alacritty tag, winit
@@ -24,7 +25,7 @@ jobs:
       - name: Base packages + unprivileged build user
         run: |
           pacman -Syu --noconfirm
-          pacman -S --noconfirm git
+          pacman -S --noconfirm git zstd
           useradd -m builder
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
           chmod 440 /etc/sudoers.d/builder
@@ -69,7 +70,38 @@ jobs:
           grep -aq org_kde_kwin_blur_manager "$bin" \
             || { echo "::error::KDE org_kde_kwin_blur fallback is gone"; exit 1; }
           echo "protocol markers OK"
+
+          # -- the inertial-scrolling patch must be in too: only
+          # alacritty-scroll-velocity.patch documents `scrolling.velocity`
+          man5=$(find "$tmp/usr/share/man/man5" -name 'alacritty.5*' | head -n1)
+          test -n "$man5" || { echo "::error::alacritty.5 man page missing"; exit 1; }
+          case "$man5" in
+            *.zst) man_txt=$(zstd -dc "$man5") ;;
+            *.gz)  man_txt=$(gzip -dc "$man5") ;;
+            *.xz)  man_txt=$(xz -dc "$man5") ;;
+            *)     man_txt=$(cat "$man5") ;;
+          esac
+          printf '%s' "$man_txt" | grep -q 'velocity' \
+            || { echo "::error::man page lacks 'scrolling.velocity' - scroll-velocity patch not applied?"; exit 1; }
+          echo "inertial scrolling marker OK"
+
+          # -- and the option must be compiled in: the velocity config field
+          # shows up in the binary's config-error strings.
+          grep -aq 'Config error: velocity' "$bin" \
+            || { echo "::error::binary has no scrolling.velocity config field - scroll-velocity patch not compiled in?"; exit 1; }
+          echo "velocity config field OK"
           rm -rf "$tmp"
+
+          # -- the local guards on top of PR #9008 must have survived the patch
+          # application: four comments in event.rs (is_active redraw loop,
+          # direction tracking, first-tick + sub-ms stop race). Without them
+          # momentum either never starts or spins the redraw loop forever.
+          ev=src/alacritty-0.17.0/alacritty/src/event.rs
+          test -f "$ev" || { echo "::error::applied source missing: $ev"; exit 1; }
+          guards=$(grep -c 'top of PR #9008' "$ev" || true)
+          test "$guards" -eq 4 \
+            || { echo "::error::expected 4 local-guard comments in $ev, found $guards - a guard was lost in a patch refresh"; exit 1; }
+          echo "local guards OK ($guards)"
 
           # -- end to end: makepkg -i installed it, it runs, it claims alacritty
           pacman -Q alacritty-blur
@@ -127,6 +159,13 @@ jobs:
           [window]
           opacity = 0.9
           blur = true
+          \`\`\`
+
+          It also ships inertial scrolling (alacritty PR #9008, closes #4175) — add to the same file:
+
+          \`\`\`toml
+          [scrolling]
+          velocity = "On"
           \`\`\`
           MDEOF
           )

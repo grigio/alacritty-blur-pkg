@@ -1,0 +1,533 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7cfb1c9..124a5fa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ Notable changes to the `alacritty_terminal` crate are documented in its
+ [CHANGELOG](./alacritty_terminal/CHANGELOG.md).
+ 
++## Unreleased
++
++### Packaging
++
++- Minimum Rust version has been bumped to 1.88.0
++
++### Added
++
++- Inertial scrolling using `scrolling.velocity` config option
++
+ ## 0.17.0
+ 
+ ### Packaging
+diff --git a/Cargo.toml b/Cargo.toml
+index 8351a01..fb4f00a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -9,7 +9,7 @@ resolver = "2"
+ 
+ [workspace.package]
+ edition = "2024"
+-rust-version = "1.85.0"
++rust-version = "1.88.0"
+ 
+ [profile.release]
+ lto = "thin"
+diff --git a/alacritty/src/config/scrolling.rs b/alacritty/src/config/scrolling.rs
+index b1b84e7..2fdea4e 100644
+--- a/alacritty/src/config/scrolling.rs
++++ b/alacritty/src/config/scrolling.rs
+@@ -10,13 +10,14 @@ pub const MAX_SCROLLBACK_LINES: u32 = 100_000;
+ #[derive(ConfigDeserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+ pub struct Scrolling {
+     pub multiplier: u8,
++    pub velocity: Velocity,
+ 
+     history: ScrollingHistory,
+ }
+ 
+ impl Default for Scrolling {
+     fn default() -> Self {
+-        Self { multiplier: 3, history: Default::default() }
++        Self { multiplier: 3, velocity: Default::default(), history: Default::default() }
+     }
+ }
+ 
+@@ -51,3 +52,24 @@ impl<'de> Deserialize<'de> for ScrollingHistory {
+         }
+     }
+ }
++
++#[derive(ConfigDeserialize, Serialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Velocity {
++    /// Enable velocity only for touch scrolling.
++    #[default]
++    Auto,
++    /// Enable velocity for all input sources.
++    On,
++    /// Disable velocity for all input sources.
++    Off,
++}
++
++impl Velocity {
++    pub fn unwrap_or(&self, default: bool) -> bool {
++        match self {
++            Self::Auto => default,
++            Self::On => true,
++            Self::Off => false,
++        }
++    }
++}
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index 46ecdad..50483ab 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -80,6 +80,15 @@ const TOUCH_ZOOM_FACTOR: f32 = 0.01;
+ /// Cooldown between invocations of the bell command.
+ const BELL_CMD_COOLDOWN: Duration = Duration::from_millis(100);
+ 
++/// Number of samples used for velocity calculation.
++///
++/// Since the latest sample is always ignored (see [`Velocity::velocity`]),
++/// this should be 1 more than the desired number of samples.
++const VELOCITY_SAMPLES: usize = 4;
++
++/// Rate of decceleration for velocity calculation.
++const VELOCITY_DAMPING: f64 = 5.;
++
+ /// The event processor.
+ ///
+ /// Stores some state from received events and dispatches actions when they are
+@@ -545,6 +554,7 @@ pub enum EventType {
+     ConfigReload(PathBuf),
+     Message(Message),
+     Scroll(Scroll),
++    Velocity(f64),
+     CreateWindow(WindowOptions),
+     #[cfg(unix)]
+     IpcConfig(IpcConfig),
+@@ -685,6 +695,7 @@ pub struct ActionContext<'a, N, T> {
+     pub master_fd: RawFd,
+     #[cfg(not(windows))]
+     pub shell_pid: u32,
++    pub velocity: &'a mut Velocity,
+ }
+ 
+ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
+@@ -735,6 +746,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+             self.on_typing_start();
+         }
+ 
++        // Cancel velocity when receiving scroll events triggered bindings.
++        if !matches!(scroll, Scroll::Delta(_)) {
++            self.cancel_velocity();
++        }
++
+         // Update dirty if actually scrolled or moved Vi cursor in Vi mode.
+         *self.dirty |=
+             lines_changed != 0 || (vi_mode && old_vi_cursor != self.terminal.vi_mode_cursor);
+@@ -1477,6 +1493,17 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+         self.inline_search_next();
+     }
+ 
++    /// Update vertical velocity based on the delta to the last touch point.
++    fn update_velocity(&mut self, y_delta: f64) {
++        self.velocity.update(y_delta);
++        *self.dirty = true;
++    }
++
++    /// Cancel all vertical velocity.
++    fn cancel_velocity(&mut self) {
++        self.velocity.cancel();
++    }
++
+     fn message(&self) -> Option<&Message> {
+         self.message_buffer.message()
+     }
+@@ -1836,6 +1863,143 @@ pub struct AccumulatedScroll {
+     pub y: f64,
+ }
+ 
++/// Input velocity tracking.
++#[derive(Default)]
++pub struct Velocity {
++    last_sample: Option<Instant>,
++    samples: [f64; VELOCITY_SAMPLES],
++    sample_count: usize,
++    direction: Option<f64>,
++
++    active_velocity: Option<(Instant, f64)>,
++}
++
++impl Velocity {
++    /// Update the active touch velocity.
++    pub fn update(&mut self, mut y_delta: f64) {
++        // Cancel velocity when direction changes.
++        //
++        // Local fix on top of PR #9008: `direction` was only assigned inside this
++        // branch, which requires it to already be `Some`; since nothing else ever
++        // sets it, direction changes never cancelled the momentum.
++        let direction = y_delta.signum();
++        if direction != 0. {
++            if self.direction.is_some_and(|d| d != direction) {
++                self.cancel();
++            }
++            self.direction = Some(direction);
++        }
++
++        // Get elapsed time since last velocity update.
++        let now = Instant::now();
++        let elapsed = match self.last_sample.take() {
++            Some(last_sample) => now - last_sample,
++            // Use first sample solely to initialize the reference timestamp.
++            None => {
++                self.last_sample = Some(now);
++                return;
++            },
++        };
++
++        // Normalize touch polling rate to 1 second.
++        //
++        // This ensures that devices with different touch polling rates still have a
++        // consistent velocity.
++        y_delta *= 1_000_000. / elapsed.as_micros() as f64;
++
++        // Update tracked velocity samples.
++        self.samples.rotate_right(1);
++        self.samples[0] = y_delta;
++        self.sample_count += 1;
++
++        self.last_sample = Some(now);
++        self.active_velocity = None;
++    }
++
++    /// Clear the active touch velocity.
++    pub fn cancel(&mut self) {
++        *self = Default::default();
++    }
++
++    /// Update the remaining velocity and get its pending changes.
++    pub fn apply(&mut self) -> Option<f64> {
++        // Short-circuit when there's no velocity active.
++        if !self.is_active() {
++            return None;
++        }
++
++        // Get or initialize the active velocity.
++        //
++        // Local fix on top of PR #9008: the first tick is measured from the last
++        // *input* sample, which can be microseconds old when the scroll event itself
++        // scheduled the redraw. Its near-zero delta then looked like "motion is over"
++        // and cancelled the momentum before it ever started — whether momentum starts
++        // was pure timing luck (works when the first frame lands a few ms after the
++        // sample, dies otherwise).
++        let fresh = self.active_velocity.is_none();
++        let (last_tick, y_velocity) = match &mut self.active_velocity {
++            Some(velocity) => velocity,
++            None => {
++                let last_tick = self.last_sample?;
++                let y = self.velocity()?;
++                self.active_velocity.insert((last_tick, y))
++            },
++        };
++
++        // Get the fractional number of 1 second intervals passed since the last tick.
++        let now = Instant::now();
++        let interval = (now - *last_tick).as_micros() as f64 / 1_000_000.;
++
++        // Update velocity and calculate the expected delta.
++        let damping_exp = f64::exp(-VELOCITY_DAMPING * interval);
++        let delta = *y_velocity * (1. - damping_exp) / VELOCITY_DAMPING;
++        *y_velocity *= damping_exp;
++
++        // Stop velocity once delta is insignificant.
++        //
++        // This assumes the tick rate is somewhat constant, extrapolating that all future
++        // ticks would be insignificant if the current tick is. A tick interval length of 0
++        // would always stop the velocity.
++        //
++        // Local fix on top of PR #9008: that extrapolation is unsound on a tick far
++        // shorter than a display frame — the delta scales with the interval, so even a
++        // full-speed velocity looks insignificant on a sub-millisecond tick (back-to-
++        // back redraws right after an input event). Never stop on such a tick while
++        // the velocity is still significant, and never stop on the very first tick;
++        // just re-base the tick and wait for a real frame.
++        let too_fast = interval < 1e-3 && y_velocity.abs() > 65.;
++        if delta.abs() > 1. || fresh || too_fast {
++            *last_tick = now;
++        } else {
++            self.cancel();
++        }
++
++        Some(delta)
++    }
++
++    /// Check whether a velocity is pending.
++    pub fn is_active(&self) -> bool {
++        // Local guard on top of PR #9008: fewer than two samples cannot produce a
++        // velocity (see `Velocity::velocity`), so flagging them as active would keep
++        // `window_context` requesting redraws forever without ever clearing the flag.
++        self.sample_count > 1
++    }
++
++    /// Get the average recorded velocity.
++    ///
++    /// We ignore the latest sample, since it corresponds to the touch release event and
++    /// is always zero (at least on Wayland).
++    fn velocity(&self) -> Option<f64> {
++        if self.sample_count < 2 {
++            return None;
++        }
++
++        let count = self.sample_count.min(VELOCITY_SAMPLES);
++        let sum: f64 = self.samples[1..count].iter().sum();
++        Some(sum / (count - 1) as f64)
++    }
++}
++
+ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+     /// Handle events from winit.
+     pub fn handle_event(&mut self, event: WinitEvent<Event>) {
+@@ -1843,6 +2007,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
+                 EventType::SearchNext => self.ctx.goto_match(None),
+                 EventType::Scroll(scroll) => self.ctx.scroll(scroll),
++                EventType::Velocity(velocity) => self.apply_velocity(velocity),
+                 EventType::BlinkCursor => {
+                     // Only change state when timeout isn't reached, since we could get
+                     // BlinkCursor and BlinkCursorTimeout events at the same time.
+diff --git a/alacritty/src/input/mod.rs b/alacritty/src/input/mod.rs
+index 7987354..bcfc420 100644
+--- a/alacritty/src/input/mod.rs
++++ b/alacritty/src/input/mod.rs
+@@ -138,6 +138,8 @@ pub trait ActionContext<T: EventListener> {
+     fn semantic_word(&self, point: Point) -> String;
+     fn on_terminal_input_start(&mut self) {}
+     fn paste(&mut self, _text: &str, _bracketed: bool) {}
++    fn update_velocity(&mut self, _y_delta: f64) {}
++    fn cancel_velocity(&mut self) {}
+     fn spawn_daemon<I, S>(&self, _program: &str, _args: I)
+     where
+         I: IntoIterator<Item = S> + Debug + Copy,
+@@ -615,6 +617,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+     }
+ 
+     fn on_mouse_press(&mut self, button: MouseButton) {
++        // Cancel velocity when a mouse button is pressed.
++        self.ctx.cancel_velocity();
++
+         // Handle mouse mode.
+         if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+             self.ctx.mouse_mut().click_state = ClickState::None;
+@@ -723,7 +728,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+     }
+ 
+     pub fn mouse_wheel_input(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
++        let velocity = self.ctx.config().scrolling.velocity.unwrap_or(false);
+         let multiplier = self.ctx.config().scrolling.multiplier;
++
+         match delta {
+             MouseScrollDelta::LineDelta(columns, lines) => {
+                 let new_scroll_px_x = columns * self.ctx.size_info().cell_width();
+@@ -732,6 +739,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+                     new_scroll_px_x as f64,
+                     new_scroll_px_y as f64,
+                     multiplier as f64,
++                    velocity,
+                 );
+             },
+             MouseScrollDelta::PixelDelta(mut lpos) => {
+@@ -749,7 +757,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+                             lpos.x = 0.;
+                         }
+ 
+-                        self.scroll_terminal(lpos.x, lpos.y, multiplier as f64);
++                        self.scroll_terminal(lpos.x, lpos.y, multiplier as f64, velocity);
+                     },
+                     _ => (),
+                 }
+@@ -757,12 +765,24 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         }
+     }
+ 
+-    fn scroll_terminal(&mut self, new_scroll_x_px: f64, new_scroll_y_px: f64, multiplier: f64) {
++    /// Handle horizontal and vertical scroll events.
++    fn scroll_terminal(
++        &mut self,
++        new_scroll_x_px: f64,
++        new_scroll_y_px: f64,
++        multiplier: f64,
++        velocity: bool,
++    ) {
+         const MOUSE_WHEEL_UP: u8 = 64;
+         const MOUSE_WHEEL_DOWN: u8 = 65;
+         const MOUSE_WHEEL_LEFT: u8 = 66;
+         const MOUSE_WHEEL_RIGHT: u8 = 67;
+ 
++        // Add scroll delta to velocity samples.
++        if velocity {
++            self.ctx.update_velocity(new_scroll_y_px * multiplier);
++        }
++
+         let width = f64::from(self.ctx.size_info().cell_width());
+         let height = f64::from(self.ctx.size_info().cell_height());
+ 
+@@ -852,6 +872,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+             self.ctx.window().set_ime_inhibitor(ImeInhibitor::TOUCH, true);
+         }
+ 
++        // Cancel velocity when a new touch slot appears.
++        self.ctx.cancel_velocity();
++
+         let touch_purpose = self.ctx.touch_purpose();
+         *touch_purpose = match mem::take(touch_purpose) {
+             TouchPurpose::None => TouchPurpose::Tap(touch),
+@@ -916,7 +939,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+                 *touch_purpose = TouchPurpose::Scroll(touch);
+ 
+                 // Use a fixed scroll factor for touchscreens, to accurately track finger motion.
+-                self.scroll_terminal(0., delta_y, 1.0);
++                let velocity = self.ctx.config().scrolling.velocity.unwrap_or(true);
++                self.scroll_terminal(0., delta_y, 1.0, velocity);
+             },
+             TouchPurpose::Select(_) => self.mouse_moved(touch.location),
+             TouchPurpose::ZoomPendingSlot(_) | TouchPurpose::Invalid(_) => (),
+@@ -966,6 +990,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         }
+     }
+ 
++    /// Apply scroll velocity delta.
++    pub fn apply_velocity(&mut self, y_delta: f64) {
++        self.scroll_terminal(0., y_delta, 1.0, false);
++    }
++
+     /// Reset mouse cursor based on modifier and terminal state.
+     #[inline]
+     pub fn reset_mouse_cursor(&mut self) {
+diff --git a/alacritty/src/window_context.rs b/alacritty/src/window_context.rs
+index 9de6679..d300037 100644
+--- a/alacritty/src/window_context.rs
++++ b/alacritty/src/window_context.rs
+@@ -36,7 +36,8 @@ use crate::config::UiConfig;
+ use crate::display::Display;
+ use crate::display::window::Window;
+ use crate::event::{
+-    ActionContext, Event, EventProxy, InlineSearchState, Mouse, SearchState, TouchPurpose,
++    ActionContext, Event, EventProxy, EventType, InlineSearchState, Mouse, SearchState,
++    TouchPurpose, Velocity,
+ };
+ #[cfg(unix)]
+ use crate::logging::LOG_TARGET_IPC_CONFIG;
+@@ -67,6 +68,7 @@ pub struct WindowContext {
+     shell_pid: u32,
+     window_config: ParsedOptions,
+     config: Rc<UiConfig>,
++    velocity: Velocity,
+ }
+ 
+ impl WindowContext {
+@@ -251,6 +253,7 @@ impl WindowContext {
+             event_queue: Default::default(),
+             modifiers: Default::default(),
+             occluded: Default::default(),
++            velocity: Default::default(),
+             mouse: Default::default(),
+             touch: Default::default(),
+             dirty: Default::default(),
+@@ -375,8 +378,8 @@ impl WindowContext {
+         // Force the display to process any pending display update.
+         self.display.process_renderer_update();
+ 
+-        // Request immediate re-draw if visual bell animation is not finished yet.
+-        if !self.display.visual_bell.completed() {
++        // Request immediate re-draw if visual bell animation or velocity are not finished yet.
++        if !self.display.visual_bell.completed() || self.velocity.is_active() {
+             // We can get an OS redraw which bypasses alacritty's frame throttling, thus
+             // marking the window as dirty when we don't have frame yet.
+             if self.display.window.has_frame {
+@@ -410,7 +413,7 @@ impl WindowContext {
+             WinitEvent::AboutToWait
+             | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
+                 // Skip further event handling with no staged updates.
+-                if self.event_queue.is_empty() {
++                if self.event_queue.is_empty() && !self.velocity.is_active() {
+                     return;
+                 }
+ 
+@@ -422,6 +425,7 @@ impl WindowContext {
+             },
+         }
+ 
++        let window_id = self.id();
+         let mut terminal = self.terminal.lock();
+ 
+         let old_is_searching = self.search_state.history_index.is_some();
+@@ -446,6 +450,7 @@ impl WindowContext {
+             shell_pid: self.shell_pid,
+             preserve_title: self.preserve_title,
+             config: &self.config,
++            velocity: &mut self.velocity,
+             event_proxy,
+             #[cfg(target_os = "macos")]
+             event_loop,
+@@ -454,6 +459,22 @@ impl WindowContext {
+         };
+         let mut processor = input::Processor::new(context);
+ 
++        // Schedule velocity update event before redraw.
++        //
++        // We do this here since a timer based event would lead to a velocity interval
++        // that doesn't match the display's refresh rate, but we still have access to the
++        // event processor context.
++        let is_redraw =
++            matches!(event, WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. });
++        if is_redraw
++            && !*processor.ctx.occluded
++            && matches!(processor.ctx.touch, TouchPurpose::None)
++            && let Some(velocity) = processor.ctx.velocity.apply()
++        {
++            let event = Event::new(EventType::Velocity(velocity), window_id);
++            self.event_queue.push(event.into());
++        }
++
+         for event in self.event_queue.drain(..) {
+             processor.handle_event(event);
+         }
+@@ -482,13 +503,9 @@ impl WindowContext {
+             self.mouse.hint_highlight_dirty = false;
+         }
+ 
+-        // Don't call `request_redraw` when event is `RedrawRequested` since the `dirty` flag
+-        // represents the current frame, but redraw is for the next frame.
+-        if self.dirty
+-            && self.display.window.has_frame
+-            && !self.occluded
+-            && !matches!(event, WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. })
+-        {
++        // If it's time for a new frame (`has_frame`) and we're `dirty` and visible (`!occluded`),
++        // but not about to redraw (`!is_redraw`), then request a redraw.
++        if self.dirty && self.display.window.has_frame && !self.occluded && !is_redraw {
+             self.display.window.request_redraw();
+         }
+     }
+diff --git a/extra/man/alacritty.5.scd b/extra/man/alacritty.5.scd
+index 06b43d0..ce9eb4c 100644
+--- a/extra/man/alacritty.5.scd
++++ b/extra/man/alacritty.5.scd
+@@ -232,6 +232,17 @@ Limited to _100000_.
+ 
+ 	Default: _3_
+ 
++*velocity* = _"Auto"_ | _"On"_ | _"Off"_
++
++	*Auto*
++		Enable velocity only for touch scrolling
++	*On*
++		Enable velocity for all input sources
++	*Off*
++		Disable velocity for all input sources
++
++	Default: _"Auto"_
++
+ # FONT
+ 
+ This section documents the *[font]* table of the configuration file.
