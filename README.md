@@ -1,5 +1,7 @@
 # alacritty-blur-pkg
 
+[![Build Arch packages](https://github.com/grigio/alacritty-blur-pkg/actions/workflows/build.yml/badge.svg)](https://github.com/grigio/alacritty-blur-pkg/actions/workflows/build.yml)
+
 Arch Linux packaging for **alacritty 0.17.0** with `ext-background-effect-v1`
 blur — the protocol served by
 [labwc-blur](https://github.com/grigio/labwc-blur-pkg).
@@ -24,6 +26,14 @@ prefers `ext-background-effect-v1` and falls back to `org_kde_kwin_blur`, so
 KDE/macOS behaviour is unchanged.
 
 ## Install
+
+Grab the package from the [latest release](https://github.com/grigio/alacritty-blur-pkg/releases/latest):
+
+```sh
+sudo pacman -U alacritty-blur-*.pkg.tar.zst
+```
+
+Or build it locally:
 
 ```sh
 makepkg -sCi
@@ -73,6 +83,19 @@ The stock package prints nothing at all for those greps.
 |---|---|
 | `PKGBUILD` | `alacritty-blur` 0.17.0, stock alacritty built against a patched winit |
 | `winit-ext-background-effect.patch` | winit 0.30.13 + `ext-background-effect-v1`, backported from winit master |
+| `.github/workflows/build.yml` | CI: builds in an `archlinux:base-devel` container, checks the protocol markers in the binary, uploads the artifact and publishes/refreshes a `v<pkgver>-<pkgrel>` release |
+
+## CI
+
+The workflow runs on pushes that touch `PKGBUILD`, the winit patch or the
+workflow itself (and on manual dispatch), inside an `archlinux:base-devel`
+container. It runs `makepkg -sCi` as an unprivileged `builder`, then fails the
+job if the packaged binary lacks `ext_background_effect_manager_v1`,
+`get_background_effect` or `set_blur_region`, if the KDE
+`org_kde_kwin_blur` fallback is gone, or if the package does not
+`provides`/`conflicts with` `alacritty`. The packages land both as an artifact
+and as the assets of a GitHub release tagged `v<pkgver>-<pkgrel>` (a rebuild of
+the same version refreshes them).
 
 ## Dropping it
 
