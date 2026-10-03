@@ -1,0 +1,11 @@
+# makepkg workdirs
+/src/
+/pkg/
+*.log
+
+# downloaded sources (makepkg fetches them again)
+*.tar.gz
+*.crate
+
+# built packages (not tracked)
+*.pkg.tar.zst

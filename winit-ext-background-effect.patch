@@ -1,0 +1,362 @@
+diff --git a/src/platform_impl/linux/wayland/state.rs b/src/platform_impl/linux/wayland/state.rs
+index 13ef99c..bad8fd2 100644
+--- a/src/platform_impl/linux/wayland/state.rs
++++ b/src/platform_impl/linux/wayland/state.rs
+@@ -29,7 +29,7 @@ use crate::platform_impl::wayland::seat::{
+     PointerConstraintsState, RelativePointerState, TextInputState, WinitPointerData,
+     WinitPointerDataExt, WinitSeatState,
+ };
+-use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
++use crate::platform_impl::wayland::types::bgr_effects::BgrEffectManager;
+ use crate::platform_impl::wayland::types::wp_fractional_scaling::FractionalScalingManager;
+ use crate::platform_impl::wayland::types::wp_viewporter::ViewporterState;
+ use crate::platform_impl::wayland::types::xdg_activation::XdgActivationState;
+@@ -106,8 +106,9 @@ pub struct WinitState {
+     /// Fractional scaling manager.
+     pub fractional_scaling_manager: Option<FractionalScalingManager>,
+ 
+-    /// KWin blur manager.
+-    pub kwin_blur_manager: Option<KWinBlurManager>,
++    /// Background effect manager (ext-background-effect-v1, falling back to
++    /// KDE's org_kde_kwin_blur).
++    pub blur_manager: Option<BgrEffectManager>,
+ 
+     /// Loop handle to re-register event sources, such as keyboard repeat.
+     pub loop_handle: LoopHandle<'static, Self>,
+@@ -176,7 +177,7 @@ impl WinitState {
+             window_events_sink: Default::default(),
+             viewporter_state,
+             fractional_scaling_manager,
+-            kwin_blur_manager: KWinBlurManager::new(globals, queue_handle).ok(),
++            blur_manager: BgrEffectManager::new(globals, queue_handle).ok(),
+ 
+             seats,
+             text_input_state: TextInputState::new(globals, queue_handle).ok(),
+diff --git a/src/platform_impl/linux/wayland/types/bgr_effects.rs b/src/platform_impl/linux/wayland/types/bgr_effects.rs
+new file mode 100644
+index 0000000..b0f0a71
+--- /dev/null
++++ b/src/platform_impl/linux/wayland/types/bgr_effects.rs
+@@ -0,0 +1,90 @@
++//! Wrapper around the background effect protocols supported by the compositor.
++//!
++//! `ext-background-effect-v1` is preferred (it is the standardized successor
++//! of KDE's `org_kde_kwin_blur`, which is tried as a fallback).
++
++use sctk::compositor::Region;
++use sctk::reexports::client::globals::{BindError, GlobalList};
++use sctk::reexports::client::protocol::wl_surface::WlSurface;
++use sctk::reexports::client::QueueHandle;
++use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
++use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
++
++use crate::platform_impl::wayland::state::WinitState;
++use crate::platform_impl::wayland::types::ext_background_effect::ExtBackgroundEffectManager;
++use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
++
++/// Wrapper around various background effects for [`WlSurface`].
++#[derive(Debug, Clone)]
++pub enum BgrEffectManager {
++    Ext(ExtBackgroundEffectManager),
++    KWin(KWinBlurManager),
++}
++
++impl BgrEffectManager {
++    pub fn new(
++        globals: &GlobalList,
++        queue_handle: &QueueHandle<WinitState>,
++    ) -> Result<Self, BindError> {
++        ExtBackgroundEffectManager::new(globals, queue_handle)
++            .map(Self::Ext)
++            .or_else(|_| KWinBlurManager::new(globals, queue_handle).map(Self::KWin))
++    }
++
++    /// Creates a new blur effect for the surface.
++    pub fn new_blur_effect(
++        &mut self,
++        surface: &WlSurface,
++        queue_handle: &QueueHandle<WinitState>,
++    ) -> SurfaceBlurEffect {
++        match self {
++            BgrEffectManager::Ext(mgr) => SurfaceBlurEffect::Ext(mgr.blur(surface, queue_handle)),
++            BgrEffectManager::KWin(mgr) => SurfaceBlurEffect::Kwin(
++                mgr.blur(surface, queue_handle),
++                mgr.clone(),
++                surface.clone(),
++            ),
++        }
++    }
++}
++
++#[derive(Debug)]
++pub enum SurfaceBlurEffect {
++    Ext(ExtBackgroundEffectSurfaceV1),
++    Kwin(OrgKdeKwinBlur, KWinBlurManager, WlSurface),
++}
++
++impl SurfaceBlurEffect {
++    /// Returns `true` if the main surface commit is required.
++    ///
++    /// `None` clears the blur.
++    #[must_use]
++    pub fn set_blur(&self, region: Option<&Region>) -> bool {
++        let region = region.map(|region| region.wl_region());
++        match self {
++            SurfaceBlurEffect::Ext(surface) => {
++                surface.set_blur_region(region);
++                true
++            },
++            SurfaceBlurEffect::Kwin(blur, ..) => {
++                blur.set_region(region);
++                blur.commit();
++                true
++            },
++        }
++    }
++}
++
++impl Drop for SurfaceBlurEffect {
++    fn drop(&mut self) {
++        match self {
++            SurfaceBlurEffect::Ext(surface) => surface.destroy(),
++            SurfaceBlurEffect::Kwin(blur, mgr, wl_surface) => {
++                blur.set_region(None);
++                blur.commit();
++                blur.release();
++                mgr.unset(wl_surface);
++            },
++        }
++    }
++}
+diff --git a/src/platform_impl/linux/wayland/types/ext_background_effect.rs b/src/platform_impl/linux/wayland/types/ext_background_effect.rs
+new file mode 100644
+index 0000000..ae217a9
+--- /dev/null
++++ b/src/platform_impl/linux/wayland/types/ext_background_effect.rs
+@@ -0,0 +1,67 @@
++//! Handling of ext-background-effect-v1 (the standardized replacement for
++//! KDE's org_kde_kwin_blur).
++
++use sctk::globals::GlobalData;
++use sctk::reexports::client::globals::{BindError, GlobalList};
++use sctk::reexports::client::protocol::wl_surface::WlSurface;
++use sctk::reexports::client::{delegate_dispatch, Connection, Dispatch, Proxy, QueueHandle};
++use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
++use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
++
++use crate::platform_impl::wayland::state::WinitState;
++
++/// ext-background-effect-v1 blur manager.
++#[derive(Debug, Clone)]
++pub struct ExtBackgroundEffectManager {
++    manager: ExtBackgroundEffectManagerV1,
++}
++
++impl ExtBackgroundEffectManager {
++    pub fn new(
++        globals: &GlobalList,
++        queue_handle: &QueueHandle<WinitState>,
++    ) -> Result<Self, BindError> {
++        let manager = globals.bind(queue_handle, 1..=1, GlobalData)?;
++        Ok(Self { manager })
++    }
++
++    pub fn blur(
++        &mut self,
++        surface: &WlSurface,
++        queue_handle: &QueueHandle<WinitState>,
++    ) -> ExtBackgroundEffectSurfaceV1 {
++        self.manager.get_background_effect(surface, queue_handle, ())
++    }
++}
++
++impl Dispatch<ExtBackgroundEffectManagerV1, GlobalData, WinitState>
++    for ExtBackgroundEffectManager
++{
++    fn event(
++        _: &mut WinitState,
++        _: &ExtBackgroundEffectManagerV1,
++        _: <ExtBackgroundEffectManagerV1 as Proxy>::Event,
++        _: &GlobalData,
++        _: &Connection,
++        _: &QueueHandle<WinitState>,
++    ) {
++        // The only event is `capabilities`, which we don't need to track:
++        // winit asks for the effect and the compositor enforces its policies.
++    }
++}
++
++impl Dispatch<ExtBackgroundEffectSurfaceV1, (), WinitState> for ExtBackgroundEffectManager {
++    fn event(
++        _: &mut WinitState,
++        _: &ExtBackgroundEffectSurfaceV1,
++        _: <ExtBackgroundEffectSurfaceV1 as Proxy>::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<WinitState>,
++    ) {
++        // There is no event
++    }
++}
++
++delegate_dispatch!(WinitState: [ExtBackgroundEffectManagerV1: GlobalData] => ExtBackgroundEffectManager);
++delegate_dispatch!(WinitState: [ExtBackgroundEffectSurfaceV1: ()] => ExtBackgroundEffectManager);
+diff --git a/src/platform_impl/linux/wayland/types/mod.rs b/src/platform_impl/linux/wayland/types/mod.rs
+index 77e67f4..15027d9 100644
+--- a/src/platform_impl/linux/wayland/types/mod.rs
++++ b/src/platform_impl/linux/wayland/types/mod.rs
+@@ -1,6 +1,8 @@
+ //! Wayland protocol implementation boilerplate.
+ 
++pub mod bgr_effects;
+ pub mod cursor;
++pub mod ext_background_effect;
+ pub mod kwin_blur;
+ pub mod wp_fractional_scaling;
+ pub mod wp_viewporter;
+diff --git a/src/platform_impl/linux/wayland/window/mod.rs b/src/platform_impl/linux/wayland/window/mod.rs
+index 6d29a5a..53c31a2 100644
+--- a/src/platform_impl/linux/wayland/window/mod.rs
++++ b/src/platform_impl/linux/wayland/window/mod.rs
+@@ -119,7 +119,7 @@ impl Window {
+         // Set transparency hint.
+         window_state.set_transparent(attributes.transparent);
+ 
+-        window_state.set_blur(attributes.blur);
++        let _ = window_state.set_blur(attributes.blur);
+ 
+         // Set the decorations hint.
+         window_state.set_decorate(attributes.decorations);
+@@ -413,7 +413,9 @@ impl Window {
+ 
+     #[inline]
+     pub fn set_blur(&self, blur: bool) {
+-        self.window_state.lock().unwrap().set_blur(blur);
++        if self.window_state.lock().unwrap().set_blur(blur) {
++            self.request_redraw();
++        }
+     }
+ 
+     #[inline]
+diff --git a/src/platform_impl/linux/wayland/window/state.rs b/src/platform_impl/linux/wayland/window/state.rs
+index 1ef7a06..b1873cb 100644
+--- a/src/platform_impl/linux/wayland/window/state.rs
++++ b/src/platform_impl/linux/wayland/window/state.rs
+@@ -28,14 +28,13 @@ use sctk::shell::WaylandSurface;
+ use sctk::shm::slot::SlotPool;
+ use sctk::shm::Shm;
+ use sctk::subcompositor::SubcompositorState;
+-use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
+ 
+ use crate::cursor::CustomCursor as RootCustomCursor;
+ use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Size};
+ use crate::error::{ExternalError, NotSupportedError};
+ use crate::platform_impl::wayland::logical_to_physical_rounded;
++use crate::platform_impl::wayland::types::bgr_effects::{BgrEffectManager, SurfaceBlurEffect};
+ use crate::platform_impl::wayland::types::cursor::{CustomCursor, SelectedCursor};
+-use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
+ use crate::platform_impl::{PlatformCustomCursor, WindowId};
+ use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme};
+ 
+@@ -143,8 +142,8 @@ pub struct WindowState {
+ 
+     viewport: Option<WpViewport>,
+     fractional_scale: Option<WpFractionalScaleV1>,
+-    blur: Option<OrgKdeKwinBlur>,
+-    blur_manager: Option<KWinBlurManager>,
++    blur: Option<SurfaceBlurEffect>,
++    blur_manager: Option<BgrEffectManager>,
+ 
+     /// Whether the client side decorations have pending move operations.
+     ///
+@@ -185,7 +184,7 @@ impl WindowState {
+ 
+         Self {
+             blur: None,
+-            blur_manager: winit_state.kwin_blur_manager.clone(),
++            blur_manager: winit_state.blur_manager.clone(),
+             compositor,
+             connection,
+             csd_fails: false,
+@@ -1079,19 +1078,44 @@ impl WindowState {
+ 
+     /// Make window background blurred
+     #[inline]
+-    pub fn set_blur(&mut self, blurred: bool) {
+-        if blurred && self.blur.is_none() {
+-            if let Some(blur_manager) = self.blur_manager.as_ref() {
+-                let blur = blur_manager.blur(self.window.wl_surface(), &self.queue_handle);
+-                blur.commit();
+-                self.blur = Some(blur);
+-            } else {
+-                info!("Blur manager unavailable, unable to change blur")
++    /// Make window background blurred.
++    ///
++    /// Returns `true` when a redraw is required for the change to be applied.
++    pub fn set_blur(&mut self, blurred: bool) -> bool {
++        if !blurred {
++            if self.blur.take().is_some() {
++                // Dropping the effect unsets/releases it on the compositor side;
++                // ext-background-effect-v1 applies the change on the next commit.
++                return true;
+             }
+-        } else if !blurred && self.blur.is_some() {
+-            self.blur_manager.as_ref().unwrap().unset(self.window.wl_surface());
+-            self.blur.take().unwrap().release();
++            return false;
++        }
++
++        if self.blur.is_some() {
++            return false;
++        }
++
++        let manager = match self.blur_manager.as_mut() {
++            Some(manager) => manager,
++            None => {
++                info!("Blur manager unavailable, unable to change blur");
++                return false;
++            },
++        };
++        let surface = self.window.wl_surface();
++        let effect = manager.new_blur_effect(&surface, &self.queue_handle);
++        // The initial blur region is empty, so ask for the whole surface. The
++        // compositor clips it to the surface size, which keeps the region valid
++        // across resizes.
++        let mut redraw = false;
++        if let Ok(region) = Region::new(&*self.compositor) {
++            region.add(0, 0, i32::MAX, i32::MAX);
++            redraw = effect.set_blur(Some(&region));
++        } else {
++            warn!("Failed to create blur region.");
+         }
++        self.blur = Some(effect);
++        redraw
+     }
+ 
+     /// Set the window title to a new value.
+@@ -1149,9 +1173,8 @@ impl WindowState {
+ 
+ impl Drop for WindowState {
+     fn drop(&mut self) {
+-        if let Some(blur) = self.blur.take() {
+-            blur.release();
+-        }
++        // Dropping the effect unsets/releases it on the compositor side.
++        drop(self.blur.take());
+ 
+         if let Some(fs) = self.fractional_scale.take() {
+             fs.destroy();
+diff --git a/src/window.rs b/src/window.rs
+index e0158ef..01a0b3a 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -954,7 +954,8 @@ impl Window {
+     /// ## Platform-specific
+     ///
+     /// - **Android / iOS / X11 / Web / Windows:** Unsupported.
+-    /// - **Wayland:** Only works with org_kde_kwin_blur_manager protocol.
++    /// - **Wayland:** Requires ext-background-effect-v1, falling back to the
++    ///   org_kde_kwin_blur_manager protocol.
+     #[inline]
+     pub fn set_blur(&self, blur: bool) {
+         let _span = tracing::debug_span!("winit::Window::set_blur", blur).entered();
