@@ -105,25 +105,31 @@ jobs:
           test -n "$ver" || { echo "no alacritty-blur package found"; exit 1; }
           tag="v$ver"
 
-          notes="Automatic build of alacritty with \`ext-background-effect-v1\` blur.
+          # The heredoc body is indented like the rest of the script: YAML
+          # strips the block scalar's 10 spaces, so the shell sees it at column 0.
+          # Unquoted delimiter expands $ver; backticks are backslash-escaped.
+          notes=$(cat <<MDEOF
+          Automatic build of alacritty with \`ext-background-effect-v1\` blur.
 
-alacritty \`$ver\` built against a winit 0.30.13 with the protocol backported from winit master (it prefers \`ext-background-effect-v1\`, falls back to KDE's \`org_kde_kwin_blur\`), so \`[window] blur = true\` reaches labwc-blur.
+          alacritty \`$ver\` built against a winit 0.30.13 with the protocol backported from winit master (it prefers \`ext-background-effect-v1\`, falls back to KDE's \`org_kde_kwin_blur\`), so \`[window] blur = true\` reaches labwc-blur.
 
-Install:
+          Install:
 
-\`\`\`sh
-sudo pacman -U alacritty-blur-*.pkg.tar.zst
-\`\`\`
+          \`\`\`sh
+          sudo pacman -U alacritty-blur-*.pkg.tar.zst
+          \`\`\`
 
-It \`provides\` and \`conflicts with\` \`alacritty\` — answer **yes** if pacman asks to remove it. Back to stock: \`sudo pacman -S alacritty\`.
+          It \`provides\` and \`conflicts with\` \`alacritty\` — answer **yes** if pacman asks to remove it. Back to stock: \`sudo pacman -S alacritty\`.
 
-Config (\`~/.config/alacritty/alacritty.toml\`):
+          Config (\`~/.config/alacritty/alacritty.toml\`):
 
-\`\`\`toml
-[window]
-opacity = 0.9
-blur = true
-\`\`\`"
+          \`\`\`toml
+          [window]
+          opacity = 0.9
+          blur = true
+          \`\`\`
+          MDEOF
+          )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $tag exists, refreshing notes + assets"
