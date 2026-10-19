@@ -35,11 +35,11 @@ moment the fingers lift, so long output takes swipe after swipe
 Upstream is on it — [PR #9008](https://github.com/alacritty/alacritty/pull/9008)
 "Add vertical scroll velocity" closes that issue — but it is not merged yet and
 is not in 0.17.0. This package carries it as `alacritty-scroll-velocity.patch`
-(7 files, +232/−16), a hand-rebased copy of that PR: a new
+(7 files, +329/−18), a hand-rebased copy of that PR: a new
 `[scrolling] velocity` option that keeps the momentum of the last scroll
 sequence and applies it frame by frame until new input arrives. The PR's
 unrelated format-string cleanups were dropped, its MSRV bump (1.85 → 1.88,
-needed for the let-chains it uses) kept, and three small guards added:
+needed for the let-chains it uses) kept, and four small guards added:
 
 - momentum counts as active only from **two samples on**, because with a single
   one (two wheel notches, then stop) nothing would ever clear the flag and the
@@ -54,7 +54,14 @@ needed for the let-chains it uses) kept, and three small guards added:
   the redraw), and a tick's delta scales with its interval — so upstream's
   "insignificant delta" check could cancel the momentum before it ever started.
   Whether inertia worked was pure timing luck; with these guards it starts
-  reliably and still stops on the first normal frame that moves less than a pixel.
+  reliably and still stops on the first normal frame that moves less than a pixel;
+- `Velocity::update` ignores samples that arrive in the **same microsecond**
+  (`as_micros()` truncates, so the elapsed time was zero and the division made
+  the velocity `inf`) and caps the normalized velocity, while `scroll_terminal`
+  rejects non-finite deltas and clamps the line/column count to the grid. Before
+  this, an `inf` delta cast to `usize` became `usize::MAX`, the mouse-report and
+  alternate-scroll loops ran essentially forever, and the heap grew until
+  systemd-oomd killed the whole session (reproduced at ~29 GiB).
 
 ## Install
 
@@ -116,12 +123,14 @@ win).
   phone and mouse; coasting may start or end sooner/later than Firefox's
   kinetic scrolling on your trackpad. Changing it means rebuilding the package.
 - **The patch is not a pure upstream copy.** Besides the rebase, it carries
-  three local guards (documented above) that work around real bugs in the PR:
+  four local guards (documented above) that work around real bugs in the PR:
   a permanent redraw loop on two-sample scrolls, direction changes that never
-  cancelled momentum (`direction` was dead code), and a momentum start that
-  only worked if the first redraw happened to land milliseconds after the last
-  input sample — likely the "always stops instantly" complaints in the PR
-  discussion. CI fails if these guards ever disappear from the applied source.
+  cancelled momentum (`direction` was dead code), a momentum start that only
+  worked if the first redraw happened to land milliseconds after the last input
+  sample — likely the "always stops instantly" complaints in the PR discussion —
+  and the zero-elapsed/`inf` velocity that could turn a scroll into an unbounded
+  loop and leak memory until the session was OOM-killed. CI fails if these guards
+  ever disappear from the applied source.
 - **`"On"` gives momentum to mouse-wheel notches too**, so a classic wheel
   mouse coasts after a notch. Use the default `"Auto"` (touch only) or `"Off"`
   if that bothers you.
@@ -170,8 +179,9 @@ job if the packaged binary lacks `ext_background_effect_manager_v1`,
 `org_kde_kwin_blur` fallback is gone, if the man page does not document
 `scrolling.velocity`, if the packaged binary has no `Config error: velocity`
 config field (i.e. the scroll-velocity patch was not compiled in), if the
-applied `event.rs` no longer carries the four local-guard comments on top of
-PR #9008 (redraw loop, direction tracking, racy first tick), or if the package
+applied `event.rs` no longer carries the five local-guard comments on top of
+PR #9008 (redraw loop, direction tracking, racy first tick, zero-elapsed /
+inf velocity), or if the package
 does not `provides`/`conflicts with` `alacritty`. The packages land both as an
 artifact and as the assets of a GitHub release tagged `v<pkgver>-<pkgrel>` (a
 rebuild of the same version refreshes them).

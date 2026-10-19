@@ -17,7 +17,7 @@
 #     inertial/kinetic scrolling, so a trackpad flick or touchscreen swipe keeps
 #     scrolling. Hand-rebased onto 0.17.0 (drops the PR's unrelated format-string
 #     cleanups); bumps the MSRV to 1.88 because of the let-chains it uses, and
-#     adds three guards:
+#     adds four guards:
 #       - `Velocity::is_active` requires two samples, since a single one (two wheel
 #         notches, then stop) would keep requesting redraws at the monitor refresh
 #         rate forever.
@@ -31,6 +31,13 @@
 #         a tick's delta scales with its interval, so upstream's "insignificant
 #         delta" check could cancel the momentum before it ever started — momentum
 #         start was pure timing luck.
+#       - `Velocity::update` ignores samples that arrive in the same microsecond
+#         (`as_micros()` truncates, giving a division by zero -> `inf` velocity)
+#         and caps the normalized velocity, while `scroll_terminal` rejects
+#         non-finite deltas and clamps the line/column count to the grid. Without
+#         those, an `inf` delta cast to `usize` is `usize::MAX`; the mouse-report
+#         and alternate-scroll loops then run essentially forever, growing the
+#         heap until systemd-oomd kills the whole session (observed: ~29 GiB).
 #
 # Drop this package with `pacman -S alacritty` to return to the stock build,
 # once winit releases the blur support (winit >= 0.31) and alacritty ships the
@@ -38,7 +45,7 @@
 
 pkgname=alacritty-blur
 pkgver=0.17.0
-pkgrel=2
+pkgrel=3
 pkgdesc='A cross-platform, GPU-accelerated terminal emulator (blur via ext-background-effect-v1, inertial scrolling)'
 url="https://github.com/alacritty/alacritty"
 arch=('x86_64')
@@ -77,7 +84,7 @@ sha256sums=(
   '38d6527d346cda5c6049332a1f3338a89ea66cd7981b54d4c3ce801b392496f8'
   'a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d'
   '173b96ab33e48944ef1b420d31d1b6a7c9d897f6d5105be19088b3605ac8cfed'
-  '1bf47bc7d0a4ecf7a80055ca312aade81a9f085bf526ee6dcf930aa1314bcbf1'
+  '3430c596f3df33c3680a6e6533e3928c20baba049c5e94f470743e683512e636'
 )
 
 prepare() {

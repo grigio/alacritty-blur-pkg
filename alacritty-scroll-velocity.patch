@@ -78,10 +78,9 @@ index b1b84e7..2fdea4e 100644
 +    }
 +}
 diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
-index 46ecdad..50483ab 100644
 --- a/alacritty/src/event.rs
 +++ b/alacritty/src/event.rs
-@@ -80,6 +80,15 @@ const TOUCH_ZOOM_FACTOR: f32 = 0.01;
+@@ -80,6 +80,23 @@
  /// Cooldown between invocations of the bell command.
  const BELL_CMD_COOLDOWN: Duration = Duration::from_millis(100);
  
@@ -94,10 +93,18 @@ index 46ecdad..50483ab 100644
 +/// Rate of decceleration for velocity calculation.
 +const VELOCITY_DAMPING: f64 = 5.;
 +
++/// Maximum scroll velocity in pixels per second.
++///
++/// Velocities are normalized from the time between input samples. A sample
++/// arriving a few microseconds after the previous one would otherwise produce
++/// an enormous (or, when the elapsed whole microseconds are zero, infinite)
++/// velocity, which then turns into a giant scroll delta on the next frame.
++const MAX_VELOCITY: f64 = 20_000.;
++
  /// The event processor.
  ///
  /// Stores some state from received events and dispatches actions when they are
-@@ -545,6 +554,7 @@ pub enum EventType {
+@@ -545,6 +562,7 @@
      ConfigReload(PathBuf),
      Message(Message),
      Scroll(Scroll),
@@ -105,7 +112,7 @@ index 46ecdad..50483ab 100644
      CreateWindow(WindowOptions),
      #[cfg(unix)]
      IpcConfig(IpcConfig),
-@@ -685,6 +695,7 @@ pub struct ActionContext<'a, N, T> {
+@@ -685,6 +703,7 @@
      pub master_fd: RawFd,
      #[cfg(not(windows))]
      pub shell_pid: u32,
@@ -113,7 +120,7 @@ index 46ecdad..50483ab 100644
  }
  
  impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
-@@ -735,6 +746,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+@@ -735,6 +754,11 @@
              self.on_typing_start();
          }
  
@@ -125,7 +132,7 @@ index 46ecdad..50483ab 100644
          // Update dirty if actually scrolled or moved Vi cursor in Vi mode.
          *self.dirty |=
              lines_changed != 0 || (vi_mode && old_vi_cursor != self.terminal.vi_mode_cursor);
-@@ -1477,6 +1493,17 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+@@ -1477,6 +1501,17 @@
          self.inline_search_next();
      }
  
@@ -143,7 +150,7 @@ index 46ecdad..50483ab 100644
      fn message(&self) -> Option<&Message> {
          self.message_buffer.message()
      }
-@@ -1836,6 +1863,143 @@ pub struct AccumulatedScroll {
+@@ -1836,6 +1871,174 @@
      pub y: f64,
  }
  
@@ -161,6 +168,11 @@ index 46ecdad..50483ab 100644
 +impl Velocity {
 +    /// Update the active touch velocity.
 +    pub fn update(&mut self, mut y_delta: f64) {
++        // Ignore invalid input; a NaN/infinity would poison every sample.
++        if !y_delta.is_finite() {
++            return;
++        }
++
 +        // Cancel velocity when direction changes.
 +        //
 +        // Local fix on top of PR #9008: `direction` was only assigned inside this
@@ -177,7 +189,7 @@ index 46ecdad..50483ab 100644
 +        // Get elapsed time since last velocity update.
 +        let now = Instant::now();
 +        let elapsed = match self.last_sample.take() {
-+            Some(last_sample) => now - last_sample,
++            Some(last_sample) => now.saturating_duration_since(last_sample),
 +            // Use first sample solely to initialize the reference timestamp.
 +            None => {
 +                self.last_sample = Some(now);
@@ -185,11 +197,26 @@ index 46ecdad..50483ab 100644
 +            },
 +        };
 +
++        // Ignore samples that are too close together to time reliably.
++        //
++        // Local fix on top of PR #9008: `as_micros()` truncates to whole
++        // microseconds, so two events in the same microsecond divide by zero and
++        // turn the velocity into infinity.
++        // Re-base the timestamp and drop the sample instead.
++        if elapsed < Duration::from_micros(1) {
++            self.last_sample = Some(now);
++            return;
++        }
++
 +        // Normalize touch polling rate to 1 second.
 +        //
 +        // This ensures that devices with different touch polling rates still have a
 +        // consistent velocity.
-+        y_delta *= 1_000_000. / elapsed.as_micros() as f64;
++        y_delta /= elapsed.as_secs_f64();
++
++        // Clamp the velocity to a sane maximum so a burst of samples cannot
++        // produce a scroll delta large enough to overflow the line count.
++        y_delta = y_delta.clamp(-MAX_VELOCITY, MAX_VELOCITY);
 +
 +        // Update tracked velocity samples.
 +        self.samples.rotate_right(1);
@@ -230,14 +257,25 @@ index 46ecdad..50483ab 100644
 +            },
 +        };
 +
++        // Guard against a poisoned velocity from an older sample.
++        if !y_velocity.is_finite() {
++            self.cancel();
++            return None;
++        }
++
 +        // Get the fractional number of 1 second intervals passed since the last tick.
 +        let now = Instant::now();
-+        let interval = (now - *last_tick).as_micros() as f64 / 1_000_000.;
++        let interval = (now - *last_tick).as_secs_f64();
 +
 +        // Update velocity and calculate the expected delta.
 +        let damping_exp = f64::exp(-VELOCITY_DAMPING * interval);
 +        let delta = *y_velocity * (1. - damping_exp) / VELOCITY_DAMPING;
 +        *y_velocity *= damping_exp;
++
++        if !delta.is_finite() || !y_velocity.is_finite() {
++            self.cancel();
++            return None;
++        }
 +
 +        // Stop velocity once delta is insignificant.
 +        //
@@ -287,7 +325,7 @@ index 46ecdad..50483ab 100644
  impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
      /// Handle events from winit.
      pub fn handle_event(&mut self, event: WinitEvent<Event>) {
-@@ -1843,6 +2007,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+@@ -1843,6 +2046,7 @@
              WinitEvent::UserEvent(Event { payload, .. }) => match payload {
                  EventType::SearchNext => self.ctx.goto_match(None),
                  EventType::Scroll(scroll) => self.ctx.scroll(scroll),
@@ -296,10 +334,9 @@ index 46ecdad..50483ab 100644
                      // Only change state when timeout isn't reached, since we could get
                      // BlinkCursor and BlinkCursorTimeout events at the same time.
 diff --git a/alacritty/src/input/mod.rs b/alacritty/src/input/mod.rs
-index 7987354..bcfc420 100644
 --- a/alacritty/src/input/mod.rs
 +++ b/alacritty/src/input/mod.rs
-@@ -138,6 +138,8 @@ pub trait ActionContext<T: EventListener> {
+@@ -138,6 +138,8 @@
      fn semantic_word(&self, point: Point) -> String;
      fn on_terminal_input_start(&mut self) {}
      fn paste(&mut self, _text: &str, _bracketed: bool) {}
@@ -308,7 +345,7 @@ index 7987354..bcfc420 100644
      fn spawn_daemon<I, S>(&self, _program: &str, _args: I)
      where
          I: IntoIterator<Item = S> + Debug + Copy,
-@@ -615,6 +617,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+@@ -615,6 +617,9 @@
      }
  
      fn on_mouse_press(&mut self, button: MouseButton) {
@@ -318,7 +355,7 @@ index 7987354..bcfc420 100644
          // Handle mouse mode.
          if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
              self.ctx.mouse_mut().click_state = ClickState::None;
-@@ -723,7 +728,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+@@ -723,7 +728,9 @@
      }
  
      pub fn mouse_wheel_input(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
@@ -328,7 +365,7 @@ index 7987354..bcfc420 100644
          match delta {
              MouseScrollDelta::LineDelta(columns, lines) => {
                  let new_scroll_px_x = columns * self.ctx.size_info().cell_width();
-@@ -732,6 +739,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+@@ -732,6 +739,7 @@
                      new_scroll_px_x as f64,
                      new_scroll_px_y as f64,
                      multiplier as f64,
@@ -336,7 +373,7 @@ index 7987354..bcfc420 100644
                  );
              },
              MouseScrollDelta::PixelDelta(mut lpos) => {
-@@ -749,7 +757,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+@@ -749,7 +757,7 @@
                              lpos.x = 0.;
                          }
  
@@ -345,7 +382,7 @@ index 7987354..bcfc420 100644
                      },
                      _ => (),
                  }
-@@ -757,12 +765,24 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+@@ -757,12 +765,30 @@
          }
      }
  
@@ -363,6 +400,12 @@ index 7987354..bcfc420 100644
          const MOUSE_WHEEL_LEFT: u8 = 66;
          const MOUSE_WHEEL_RIGHT: u8 = 67;
  
++        // Drop invalid deltas outright; casting them to `usize` would saturate
++        // to `usize::MAX` and turn a single event into an unbounded scroll loop.
++        if !new_scroll_x_px.is_finite() || !new_scroll_y_px.is_finite() {
++            return;
++        }
++
 +        // Add scroll delta to velocity samples.
 +        if velocity {
 +            self.ctx.update_velocity(new_scroll_y_px * multiplier);
@@ -371,7 +414,30 @@ index 7987354..bcfc420 100644
          let width = f64::from(self.ctx.size_info().cell_width());
          let height = f64::from(self.ctx.size_info().cell_height());
  
-@@ -852,6 +872,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+@@ -771,8 +797,20 @@
+         self.ctx.mouse_mut().accumulated_scroll.x += new_scroll_x_px * multiplier;
+         self.ctx.mouse_mut().accumulated_scroll.y += new_scroll_y_px * multiplier;
+ 
+-        let lines = (self.ctx.mouse().accumulated_scroll.y / height).abs() as usize;
+-        let columns = (self.ctx.mouse().accumulated_scroll.x / width).abs() as usize;
++        // A single scroll event can never move through more content than the
++        // terminal actually has, so clamp the line/column count. Without this,
++        // a bogus (or merely huge) delta makes the loops below run for an
++        // unbounded number of iterations, growing memory until the OOM killer
++        // steps in.
++        let (max_lines, max_columns) = {
++            let grid = self.ctx.terminal().grid();
++            (grid.history_size().saturating_add(grid.screen_lines()), grid.columns())
++        };
++
++        let accumulated_x = self.ctx.mouse().accumulated_scroll.x;
++        let accumulated_y = self.ctx.mouse().accumulated_scroll.y;
++        let lines = ((accumulated_y / height).abs() as usize).min(max_lines);
++        let columns = ((accumulated_x / width).abs() as usize).min(max_columns);
+ 
+         let is_scroll_up = new_scroll_y_px > 0.;
+         let event = if is_scroll_up { MouseEvent::WheelUp } else { MouseEvent::WheelDown };
+@@ -852,6 +890,9 @@
              self.ctx.window().set_ime_inhibitor(ImeInhibitor::TOUCH, true);
          }
  
@@ -381,7 +447,7 @@ index 7987354..bcfc420 100644
          let touch_purpose = self.ctx.touch_purpose();
          *touch_purpose = match mem::take(touch_purpose) {
              TouchPurpose::None => TouchPurpose::Tap(touch),
-@@ -916,7 +939,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+@@ -916,7 +957,8 @@
                  *touch_purpose = TouchPurpose::Scroll(touch);
  
                  // Use a fixed scroll factor for touchscreens, to accurately track finger motion.
@@ -391,7 +457,7 @@ index 7987354..bcfc420 100644
              },
              TouchPurpose::Select(_) => self.mouse_moved(touch.location),
              TouchPurpose::ZoomPendingSlot(_) | TouchPurpose::Invalid(_) => (),
-@@ -966,6 +990,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+@@ -966,6 +1008,11 @@
          }
      }
  

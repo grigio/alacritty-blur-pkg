@@ -93,14 +93,15 @@ jobs:
           rm -rf "$tmp"
 
           # -- the local guards on top of PR #9008 must have survived the patch
-          # application: four comments in event.rs (is_active redraw loop,
-          # direction tracking, first-tick + sub-ms stop race). Without them
-          # momentum either never starts or spins the redraw loop forever.
+          # application: five comments in event.rs (is_active redraw loop,
+          # direction tracking, first-tick + sub-ms stop race, zero-elapsed /
+          # inf velocity clamp). Without them momentum either never starts or the
+          # scroll loops run away and leak memory until the session is OOM-killed.
           ev=src/alacritty-0.17.0/alacritty/src/event.rs
           test -f "$ev" || { echo "::error::applied source missing: $ev"; exit 1; }
           guards=$(grep -c 'top of PR #9008' "$ev" || true)
-          test "$guards" -eq 4 \
-            || { echo "::error::expected 4 local-guard comments in $ev, found $guards - a guard was lost in a patch refresh"; exit 1; }
+          test "$guards" -eq 5 \
+            || { echo "::error::expected 5 local-guard comments in $ev, found $guards - a guard was lost in a patch refresh"; exit 1; }
           echo "local guards OK ($guards)"
 
           # -- end to end: makepkg -i installed it, it runs, it claims alacritty
