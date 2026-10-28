@@ -1,15 +1,17 @@
 # Upstream report: enabling `ext-background-effect-v1` blur in Alacritty
 
 Prepared from the `alacritty-blur` 0.17.0 packaging (local backport of the protocol
-into winit 0.30.13). All facts verified against upstream sources on 2026-10-03.
+into winit 0.30.13). Facts verified against upstream sources on 2026-10-03;
+§3 (cosmic-comp) added and verified on 2026-10-28.
 
 **TL;DR**
 
 | where | status | what is still needed |
 |---|---|---|
-| winit | ✅ already merged, shipped in `0.31.0-beta.3` | release `0.31.0` final — and, ideally, backport to the `0.30.x` line |
+| winit | ✅ already merged, shipped in `0.31.0-beta.3` (and `beta.4`) | release `0.31.0` final — and, ideally, backport to the `0.30.x` line |
 | alacritty | ✅ feature is fully plumbed, no protocol code to write | bump `winit` to `0.31` (PR #8750, rebase to beta.3) + docs update |
 | wayland-protocols | ✅ nothing | — (`staging/ext-background-effect` already in `0.32.8+`) |
+| cosmic-comp | ✅ protocol exposed since `epoch-1.3.0` | nothing client-side: the effect is gated by the user's theme (`frosted_windows`), see §3 |
 
 ---
 
@@ -144,3 +146,77 @@ Expected against a compositor serving the protocol:
 
 Stock `alacritty` 0.17.0 prints none of these (it binds only
 `org_kde_kwin_blur_manager`, which non-KDE compositors do not advertise).
+
+---
+
+## 3. Report for **pop-os/cosmic-comp**
+
+### Already done (no code change required)
+
+Verified 2026-10-28 against `cosmic-comp 1:1.10.0-1.1` (Arch) and upstream
+`master` (`5d6cfab`). Nothing needs to be implemented for clients:
+
+| evidence | what |
+|---|---|
+| `src/wayland/handlers/background_effect.rs` | `impl ExtBackgroundEffectHandler for State`, `fn capabilities() -> Capability::Blur` |
+| `src/state.rs:718` | `BackgroundEffectState::new::<Self>(dh)` — the global is registered for every client |
+| `wayland-info` inside a nested cosmic-comp | `interface: 'ext_background_effect_manager_v1', version: 1` |
+| `WAYLAND_DEBUG=1 alacritty` inside it | `bind(... "ext_background_effect_manager_v1", 1)` → `capabilities(1)` → `get_background_effect` → `set_blur_region` |
+
+First release carrying it: tag `epoch-1.3.0` (absent in `epoch-1.2.0`, from
+[PR #2179](https://github.com/pop-os/cosmic-comp/pull/2179), merged 2026-07-09).
+This matches what the maintainer said when closing
+[#2598](https://github.com/pop-os/cosmic-comp/issues/2598) as completed:
+*"It is exposed to clients, ghostty only supports the kde-blur protocol in it's
+latest release."*
+
+### The part that is easy to miss: blur is off by default
+
+A client that does everything correctly still gets transparency only, because
+rendering the effect is gated on the theme:
+
+```rust
+// src/shell/element/window.rs:381 (master)
+let frosted = if theme.cosmic().frosted_windows {
+    (theme.cosmic().frosted as u8 + 1) as usize
+} else {
+    0
+};
+```
+
+```rust
+// src/backend/render/wayland/blur_effect.rs:221
+if strength == 0 || geometry.size.w == 0. || geometry.size.h == 0. {
+    return Ok(None);
+}
+```
+
+`frosted_windows` defaults to **`false`** (libcosmic
+`cosmic-theme/src/model/theme.rs:942`), and setting the thickness
+(`frosted: Medium`) alone changes nothing. The user has to enable
+**Settings → Desktop → Appearance → Frosted glass → Windows**, or write the
+config key:
+
+```sh
+echo true > ~/.config/cosmic/com.system76.CosmicTheme.Dark/v2/frosted_windows
+```
+
+Because `capabilities()` answers `Blur` unconditionally, the client cannot tell
+that the effect was dropped — it sees a successful request and renders normally.
+That silence is the same root cause behind the "third-party blur does not work"
+reports [#2567](https://github.com/pop-os/cosmic-comp/issues/2567) and
+[#2719](https://github.com/pop-os/cosmic-comp/issues/2719) (both closed, both
+answered with "the app/compositor already supports it").
+
+### Whether to file a new issue
+
+No bug to report — the behaviour is deliberate and already triaged. If a report
+is ever wanted, these are the two soft spots, both cosmetic:
+
+1. **Log the drop.** `set_blur_region` could log once at `info`/`debug` when the
+   surface stores a region while `frosted_windows` is false, so the "I see
+   transparency but no blur" case is diagnosable without reading the source.
+2. **`frosted_maximized_apps` is a dead theme key.** It exists in libcosmic and
+   is written by cosmic-settings, but no code path in cosmic-comp reads it
+   (grep on `master`: no hits outside libcosmic). Worth confirming whether
+   maximized windows were meant to have their own switch.

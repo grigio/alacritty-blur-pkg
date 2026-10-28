@@ -3,28 +3,82 @@
 [![Build Arch packages](https://github.com/grigio/alacritty-blur-pkg/actions/workflows/build.yml/badge.svg)](https://github.com/grigio/alacritty-blur-pkg/actions/workflows/build.yml)
 
 Arch Linux packaging for **alacritty 0.17.0** with `ext-background-effect-v1`
-blur — the protocol served by
-[labwc-blur](https://github.com/grigio/labwc-blur-pkg) — and with **inertial
-(kinetic) scrolling**, which stock alacritty still lacks
+blur — the standardized protocol served by
+[labwc-blur](https://github.com/grigio/labwc-blur-pkg), cosmic-comp, KDE Plasma
+6.7+ and other compositors — and with **inertial (kinetic) scrolling**, which
+stock alacritty still lacks
 ([alacritty#4175](https://github.com/alacritty/alacritty/issues/4175)).
 
 ## Why
 
 Alacritty has a `[window] blur = true` option, but the request goes through
 **winit**, and winit 0.30 only speaks KDE's legacy `org_kde_kwin_blur_manager`.
-labwc-blur serves the standardized `ext-background-effect-v1` instead, so the
-request finds no global and is silently dropped: you get the `opacity`, never
-the blur.
+Every other compositor — labwc-blur, cosmic-comp, anything new — serves the
+standardized `ext-background-effect-v1` instead, so the request finds no global
+and is silently dropped: you get the `opacity`, never the blur.
 
-The support exists upstream on **winit master** (0.31,
-`winit-wayland/src/types/{ext_background_effect,bgr_effects}.rs`) — but it is
-unreleased, not even in `0.31.0-beta.3` — and alacritty still requires winit
-0.30, so simply updating alacritty (0.17.0 is the latest release) cannot help.
+The support exists upstream on **winit 0.31 pre-releases**
+(`winit-wayland/src/types/{ext_background_effect,bgr_effects}.rs`, first shipped
+in `0.31.0-beta.3`, also in `beta.4`) — but there is no final `0.31.0`, cargo
+will never select a pre-release for alacritty's `winit = "0.30.9"` requirement,
+and the `0.31` migration (PR #8750) has not landed, so simply updating alacritty
+(0.17.0 is the latest release) cannot help.
 
 This package therefore builds alacritty 0.17.0 against a winit 0.30.13 with
 that support backported, see `winit-ext-background-effect.patch` (7 files,
 ~360 lines). The patched winit prefers `ext-background-effect-v1` and falls
 back to `org_kde_kwin_blur`, so KDE/macOS behaviour is unchanged.
+
+## Compositor support
+
+The package is compositor-agnostic: whatever serves
+`ext-background-effect-v1` gets blur, whatever does not stays transparent.
+
+| compositor | works out of the box | notes |
+|---|---|---|
+| **labwc** + [labwc-blur](https://github.com/grigio/labwc-blur-pkg) | ✅ | what this package was written for |
+| **cosmic-comp** (COSMIC ≥ 1.3, tag `epoch-1.3.0`) | ⚠️ after one toggle | needs **Settings → Desktop → Appearance → Frosted glass → Windows**, see below |
+| **KDE Plasma ≥ 6.7** | ✅ | served natively |
+| **COSMIC < 1.3**, stock labwc/sway/mutter without the protocol | ❌ | transparency only; nothing for the client to bind |
+
+### cosmic-comp: enable "Windows" frosted glass
+
+cosmic-comp advertises `ext_background_effect_manager_v1` with the `blur`
+capability to every client, but it only *renders* the effect when the theme
+enables it per surface class. In `src/shell/element/window.rs`:
+
+```rust
+let frosted = if theme.cosmic().frosted_windows {
+    (theme.cosmic().frosted as u8 + 1) as usize
+} else {
+    0
+};
+```
+
+and `BlurElement::internal()` returns `Ok(None)` when the strength is `0`. The
+default is **off** (`frosted_windows: false` in libcosmic's `Theme::default()`),
+which produces exactly the "transparency but no blur" symptom — the client does
+everything right and the compositor drops it on the floor.
+
+Turn it on in the GUI (**Settings → Desktop → Appearance → Frosted glass**,
+toggle **Windows**; **Frost thickness** sets the strength), or write the keys
+directly:
+
+```sh
+for t in Dark Light; do
+  echo true > ~/.config/cosmic/com.system76.CosmicTheme.$t/v2/frosted_windows
+done
+```
+
+`cosmic-config` watches those files, so no restart is needed. Note that
+`frosted` (the thickness) and `frosted_windows` (the per-surface switch) are
+independent: setting the thickness alone still renders nothing.
+
+The same gate is why third-party blur looked broken in
+[cosmic-comp#2567](https://github.com/pop-os/cosmic-comp/issues/2567) and
+[#2598](https://github.com/pop-os/cosmic-comp/issues/2598) — the latter was
+closed as completed with *"It is exposed to clients"*, which is true, but the
+theme switch is the part that is easy to miss.
 
 ## Why inertial scrolling
 
@@ -136,15 +190,23 @@ win).
   if that bothers you.
 - **Momentum is vertical only** and is killed by any new input — by design,
   but it means a click or keyboard scroll during a coast stops it immediately.
-- **Tested on Wayland/labwc** with a laptop trackpad, a touchscreen path that
-  only got synthetic-input coverage, and no X11/macOS/Windows testing (this
-  package is Arch/Linux only anyway).
+- **Blur is the compositor's call.** The client can only ask: cosmic-comp and
+  other compositors may gate the effect behind a per-surface setting
+  (`frosted_windows` on COSMIC), and a compositor that implements neither
+  `ext-background-effect-v1` nor `org_kde_kwin_blur` leaves the window
+  translucent only. See *Compositor support* above.
+- **Tested on Wayland/labwc and cosmic-comp** with a laptop trackpad, a
+  touchscreen path that only got synthetic-input coverage, and no
+  X11/macOS/Windows testing (this package is Arch/Linux only anyway). The
+  cosmic-comp test was protocol-level (`capabilities(1)`, `set_blur_region`
+  accepted); the visual check was done on labwc.
 - The patch bumps the **MSRV to 1.88** (let-chains). No runtime effect; only
   matters if you build with an older Rust.
 
 ## Verify
 
-With a labwc session running:
+In a session of any compositor serving the protocol (labwc-blur, cosmic-comp,
+KDE 6.7+):
 
 ```sh
 WAYLAND_DEBUG=1 alacritty 2>&1 | grep -E "background_effect|set_blur_region"
@@ -153,12 +215,24 @@ WAYLAND_DEBUG=1 alacritty 2>&1 | grep -E "background_effect|set_blur_region"
 Expected on startup:
 
 ```
--> wl_registry#2.bind(48, "ext_background_effect_manager_v1", 1, ...)
--> ext_background_effect_manager_v1#16.get_background_effect(new id ext_background_effect_surface_v1#47, wl_surface#41)
--> ext_background_effect_surface_v1#47.set_blur_region(wl_region#48)
+-> wl_registry#2.bind(38, "ext_background_effect_manager_v1", 1, ...)
+ext_background_effect_manager_v1#16.capabilities(1)
+-> ext_background_effect_manager_v1#16.get_background_effect(new id ext_background_effect_surface_v1#46, wl_surface#40)
+-> ext_background_effect_surface_v1#46.set_blur_region(wl_region#47)
 ```
 
-The stock package prints nothing at all for those greps.
+`capabilities(1)` is the `blur` bit: the compositor advertises the feature. It
+does so even when a per-surface setting will later drop the effect (cosmic-comp
+answers `blur` unconditionally and only honours it when `frosted_windows` is
+on), so these lines prove the client side is fine, not that pixels change. If
+the `bind` line is missing entirely the compositor does not implement the
+protocol, and the stock package prints none of these lines at all.
+
+Beware of clients built against **wayland-protocols 1.45**, which shipped
+`EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR` as `0`; such a binary sees no
+blur support and silently skips the request. This package is unaffected (it
+compiles `wayland-protocols` 0.32.9 from the lock file), but a distro package
+built in that window may not be.
 
 ## Contents
 

@@ -3,8 +3,9 @@
 #
 # Upstream alacritty 0.17.0 has a [window] blur option, but the request goes
 # through winit, and winit 0.30 only implements KDE's org_kde_kwin_blur_manager.
-# labwc-blur serves the standardized ext-background-effect-v1 protocol instead,
-# so the request found no global and was silently dropped (transparency only).
+# labwc-blur and cosmic-comp serve the standardized ext-background-effect-v1
+# protocol instead, so the request found no global and was silently dropped
+# (transparency only).
 #
 # This package builds alacritty 0.17.0 with two local patches:
 #
@@ -42,6 +43,13 @@
 # Drop this package with `pacman -S alacritty` to return to the stock build,
 # once winit releases the blur support (winit >= 0.31) and alacritty ships the
 # scroll velocity patch itself.
+#
+# Note for cosmic-comp users: the compositor exposes ext-background-effect-v1 to
+# clients, but only renders the effect when the theme enables it. Turn on
+# Settings -> Desktop -> Appearance -> Frosted glass -> Windows (or write
+# `true` into ~/.config/cosmic/com.system76.CosmicTheme.{Dark,Light}/v2/
+# frosted_windows). Without it the window stays translucent and nothing is
+# blurred, with no client-side error to report.
 
 pkgname=alacritty-blur
 pkgver=0.17.0
